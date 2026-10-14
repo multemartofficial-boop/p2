@@ -1,0 +1,446 @@
+import { useMemo, useState } from "react";
+import { createFileRoute } from "@tanstack/react-router";
+import { Plus, Pencil, Trash2 } from "lucide-react";
+import { AdminShell } from "@/components/hr/admin-shell";
+import {
+  Card,
+  DataTable,
+  EmptyRow,
+  Field,
+  GhostButton,
+  Modal,
+  Person,
+  PrimaryButton,
+  StatCard,
+  StatusBadge,
+  Td,
+  Th,
+  inputCls,
+} from "@/components/hr/bits";
+import { useApi } from "@/lib/api-store";
+import { PayrollSummary } from "@/components/hr/payroll-summary";
+import { fmtDate, todayISO, hoursBetween, money2, proratedMonthlySalary } from "@/lib/hr-utils";
+import type { Attendance } from "@/lib/mock-data";
+
+export const Route = createFileRoute("/admin/attendance")({
+  head: () => ({
+    meta: [
+      { title: "Attendance — WorkHR" },
+      { name: "description", content: "Daily check-in and check-out records per worker, location and source." },
+      { property: "og:title", content: "Attendance — WorkHR" },
+      { property: "og:description", content: "Daily check-in and check-out records per worker, location and source." },
+    ],
+  }),
+  component: AttendancePage,
+});
+
+type FormState = { workerId: string; date: string; in: string; out: string; location: string };
+
+const distMeters = (lat1: number, lng1: number, lat2: number, lng2: number) => {
+  const R = 6371000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const a =
+    Math.sin(toRad(lat2 - lat1) / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(toRad(lng2 - lng1) / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(a)));
+};
+
+function EntryForm({
+  initial,
+  editing,
+  onClose,
+}: {
+  initial: FormState;
+  editing: Attendance | null;
+  onClose: () => void;
+}) {
+  const { workers, locations, addAttendance, updateAttendance, settings } = useApi();
+  const [form, setForm] = useState<FormState>(initial);
+  const accrualRate = settings?.holidayAccrualRate ?? 12.07;
+  const set = (k: keyof FormState) => (e: { target: { value: string } }) =>
+    setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!workers || workers.length === 0) {
+      alert('No workers available. Please create workers first.');
+      return;
+    }
+    const w = workers.find((x) => x.id === form.workerId);
+    if (!w) return;
+    if (editing) {
+      await updateAttendance(editing.id, { ...form, worker: w.name });
+    } else {
+      const result = await addAttendance({
+        workerId: form.workerId,
+        date: form.date,
+        in: form.in,
+        out: form.out,
+        location: form.location,
+        worker: w.name,
+        source: "Admin"
+      });
+      if (!result) {
+        alert('Failed to add attendance. Please try again.');
+        return;
+      }
+    }
+    onClose();
+  };
+
+  return (
+    <Modal
+      title={editing ? "Edit attendance entry" : "Add attendance entry"}
+      description={editing ? `Editing ${editing.id}` : "Manually recorded entries are tagged as Admin."}
+      onClose={onClose}
+    >
+      <form onSubmit={submit} className="grid gap-4 sm:grid-cols-2">
+        <Field label="Worker" className="sm:col-span-2">
+          <select required value={form.workerId} onChange={set("workerId")} className={inputCls}>
+            {workers?.map((w) => (
+              <option key={w.id} value={w.id}>
+                {w.name} — {w.id}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Date">
+          <input required type="date" value={form.date} onChange={set("date")} className={inputCls} />
+        </Field>
+        <Field label="Location">
+          <select required value={form.location} onChange={set("location")} className={inputCls}>
+            {locations?.map((l) => (
+              <option key={l.id}>{l.name}</option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Time in">
+          <input required type="time" value={form.in} onChange={set("in")} className={inputCls} />
+        </Field>
+        <Field label="Time out">
+          <input type="time" value={form.out} onChange={set("out")} className={inputCls} placeholder="Still checked in" />
+        </Field>
+        <p className="sm:col-span-2 rounded-lg bg-secondary/60 px-3 py-2 text-sm text-muted-foreground">
+          Total hours:{" "}
+          <strong className="text-foreground">
+            {form.out ? `${hoursBetween(form.in, form.out).toFixed(2)} h` : "— (still active)"}
+          </strong>
+          {form.out && (
+            <>
+              {" · "}Holiday accrual ({accrualRate}%):{" "}
+              <strong className="text-foreground">
+                {(hoursBetween(form.in, form.out) * accrualRate / 100).toFixed(2)} h
+              </strong>
+            </>
+          )}
+        </p>
+        <div className="sm:col-span-2 flex justify-end gap-2">
+          <GhostButton type="button" onClick={onClose}>
+            Cancel
+          </GhostButton>
+          <PrimaryButton type="submit">{editing ? "Save changes" : "Add entry"}</PrimaryButton>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function AttendancePage() {
+  const { attendance, workers, locations, settings, deleteAttendance, loading, error, loadAttendance } = useApi();
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState<Attendance | null>(null);
+  const [workerFilter, setWorkerFilter] = useState("all");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [period, setPeriod] = useState<"weekly" | "monthly" | "yearly">("weekly");
+
+  const rows = useMemo(
+    () =>
+      [...(attendance || [])]
+        .filter((a) => (workerFilter === "all" ? true : a.workerId === workerFilter))
+        .filter((a) => (from ? a.date >= from : true))
+        .filter((a) => (to ? a.date <= to : true))
+        .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)),
+    [attendance, workerFilter, from, to],
+  );
+
+  const today = todayISO();
+  const todayRows = (attendance || []).filter((a) => a.date === today);
+  const avg = rows.length ? rows.reduce((t, a) => t + a.hours, 0) / rows.length : 0;
+  const openShifts = todayRows.filter((a) => a.out === "00:00:00" || a.out === "00:00");
+
+  // Gross total for the currently filtered range: hourly rows cost hours ×
+  // rate; salaried workers contribute their monthly salary prorated by the
+  // calendar days inside the filtered range (bounded by join date).
+  const filteredTotalHours = rows.reduce((t, a) => t + a.hours, 0);
+  const grossTotal = useMemo(() => {
+    if (!rows.length) return 0;
+    const minD = rows.reduce((m, a) => (a.date < m ? a.date : m), rows[0].date);
+    const maxD = rows.reduce((m, a) => (a.date > m ? a.date : m), rows[0].date);
+    const rangeFrom = from || minD;
+    const rangeTo = to || maxD;
+    let total = 0;
+    const salariedIds = new Set<string>();
+    for (const a of rows) {
+      const w = workers?.find((x) => x.id === a.workerId);
+      if (w?.payType === "salary") {
+        salariedIds.add(a.workerId);
+        continue;
+      }
+      total += a.hours * (w?.rate ?? settings?.hourlyRate ?? 0);
+    }
+    for (const id of salariedIds) {
+      const w = workers?.find((x) => x.id === id);
+      total += proratedMonthlySalary(Number(w?.monthlySalary) || 0, rangeFrom, rangeTo, w?.joined).amount;
+    }
+    return Math.round(total * 100) / 100;
+  }, [rows, workers, settings, from, to]);
+
+  if (loading.attendance) {
+    return (
+      <AdminShell title="Attendance">
+        <div className="flex items-center justify-center h-64">
+          <div className="text-muted-foreground">Loading attendance...</div>
+        </div>
+      </AdminShell>
+    );
+  }
+
+  if (error) {
+    return (
+      <AdminShell title="Attendance">
+        <div className="flex flex-col items-center justify-center h-64 gap-4">
+          <div className="text-red-500 font-medium">Failed to load attendance</div>
+          <div className="text-sm text-muted-foreground">{error}</div>
+          <button
+            onClick={() => loadAttendance()}
+            className="px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm"
+          >
+            Retry
+          </button>
+        </div>
+      </AdminShell>
+    );
+  }
+
+  const blank: FormState = {
+    workerId: (workers && workers.length > 0) ? workers[0].id : "",
+    date: today,
+    in: "08:00",
+    out: "17:00",
+    location: (locations && locations.length > 0) ? locations[0].name : "",
+  };
+
+  return (
+    <AdminShell
+      title="Attendance"
+      action={
+        <button
+          onClick={() => {
+            if (!workers || workers.length === 0) {
+              alert('No workers available. Please create workers first by approving registration applications.');
+              return;
+            }
+            setEditing(null);
+            setOpen(true);
+          }}
+          className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground"
+        >
+          <Plus className="size-4" /> Add Entry
+        </button>
+      }
+    >
+      <div className="space-y-3">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <StatCard label="Entries Today" value={String(todayRows.length)} hint="recorded" />
+          <StatCard label="Average Hours / Entry" value={`${avg.toFixed(2)}h`} hint="current filter" />
+          <StatCard
+            label="Currently Checked In"
+            value={String(openShifts.length)}
+            hint="open shifts"
+            tone="down"
+          />
+        </div>
+
+        <Card className="p-0">
+          <div className="flex flex-wrap items-center gap-3 p-5">
+            <h2 className="mr-auto text-base font-semibold">Attendance Log ({rows.length})</h2>
+            <input
+              type="date"
+              value={from}
+              onChange={(e) => setFrom(e.target.value)}
+              className="h-9 rounded-lg border border-border bg-card px-3 text-sm outline-none focus:border-primary"
+            />
+            <input
+              type="date"
+              value={to}
+              onChange={(e) => setTo(e.target.value)}
+              className="h-9 rounded-lg border border-border bg-card px-3 text-sm outline-none focus:border-primary"
+            />
+            <select
+              value={workerFilter}
+              onChange={(e) => setWorkerFilter(e.target.value)}
+              className="h-9 rounded-lg border border-border bg-card px-3 text-sm outline-none focus:border-primary"
+            >
+              <option value="all">All Workers</option>
+              {workers && workers.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <DataTable
+            labels={["Worker", "Date", "Check-In", "Check-Out", "Location", "Total Hours", "Holiday", "Source", "Action"]}
+            head={
+              <>
+                <Th>Worker</Th>
+                <Th>Date</Th>
+                <Th>Check-In</Th>
+                <Th>Check-Out</Th>
+                <Th>Location</Th>
+                <Th>Total Hours</Th>
+                <Th>Holiday</Th>
+                <Th>Source</Th>
+                <Th className="text-right">Action</Th>
+              </>
+            }
+          >
+            {rows.length === 0 && <EmptyRow colSpan={9} text="No attendance records for this filter." />}
+            {rows.map((a) => (
+              <tr key={a.id} className="hover:bg-secondary/40">
+                <Td>
+                  <div className="flex items-center gap-2">
+                    {(!a.out || a.out === "00:00:00" || a.out === "00:00") && (
+                      <div className="w-2 h-2 rounded-full bg-green-500" title="Currently checked in" />
+                    )}
+                    <Person name={a.worker} />
+                  </div>
+                </Td>
+                <Td>{fmtDate(a.date)}</Td>
+                <Td>{a.in}</Td>
+                <Td>{a.out}</Td>
+                <Td>
+                  <div className="flex items-center gap-1.5 leading-tight">
+                    {a.checkInLat != null && (() => {
+                      const loc = locations?.find((l) => l.name === a.location);
+                      const dist =
+                        a.distanceMeters != null
+                          ? a.distanceMeters
+                          : loc?.latitude != null && loc?.longitude != null && a.checkInLng != null
+                            ? distMeters(a.checkInLat, a.checkInLng, Number(loc.latitude), Number(loc.longitude))
+                            : null;
+                      const near = a.location === "Unknown/Unmatched" && a.nearestLocation
+                        ? ` — nearest: ${a.nearestLocation}`
+                        : "";
+                      const tip = `${a.locationMismatch ? "Location Mismatch" : "Within radius"}${near} — GPS: ${a.checkInLat.toFixed(5)}, ${a.checkInLng?.toFixed(5)}${dist != null ? ` — ${dist}m from site` : ""}`;
+                      return (
+                        <span
+                          className={`inline-block size-2.5 shrink-0 rounded-full ${a.locationMismatch ? "bg-danger" : "bg-success"}`}
+                          title={tip}
+                        />
+                      );
+                    })()}
+                    <div className="leading-tight">
+                      <p>{a.location}</p>
+                      {a.assignmentStatus === "match" && (
+                        <p className="text-xs font-medium text-green-600">Assignment Match</p>
+                      )}
+                      {a.assignmentStatus === "mismatch" && (
+                        <p className="text-xs font-medium text-danger">Assignment Mismatch</p>
+                      )}
+                    </div>
+                  </div>
+                </Td>
+                <Td className="font-medium">{a.hours.toFixed(2)} h</Td>
+                <Td className="text-muted-foreground">
+                  <span title={`Statutory holiday accrued: ${((a.holidayAccruedHours ?? 0) * 60).toFixed(1)} min`}>
+                    {(a.holidayAccruedHours ?? 0).toFixed(2)} h
+                  </span>
+                </Td>
+                <Td><StatusBadge status={a.source} /></Td>
+                <Td>
+                  <div className="flex justify-end gap-1 text-muted-foreground">
+                    <button
+                      onClick={() => {
+                        setEditing(a);
+                        setOpen(true);
+                      }}
+                      className="rounded-md p-1.5 hover:bg-secondary hover:text-primary"
+                    >
+                      <Pencil className="size-4" />
+                    </button>
+                    <button
+                      onClick={() => deleteAttendance(a.id)}
+                      className="rounded-md p-1.5 hover:bg-secondary hover:text-danger"
+                    >
+                      <Trash2 className="size-4" />
+                    </button>
+                  </div>
+                </Td>
+              </tr>
+            ))}
+          </DataTable>
+
+          {/* Gross total for the currently filtered range */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-5 py-3 text-sm">
+            <span className="text-muted-foreground">
+              Filtered totals — {rows.length} entries · {filteredTotalHours.toFixed(2)} h
+            </span>
+            <span className="font-semibold" title="Hours × rate for hourly workers + monthly salaries prorated over the filtered range">
+              Est. gross pay: {money2(grossTotal)}
+            </span>
+          </div>
+        </Card>
+
+        {/* Payroll period summary (moved from Reports — Part 3) */}
+        <Card className="p-0">
+          <div className="flex flex-wrap items-center gap-3 p-5 pb-0">
+            <div>
+              <h2 className="text-base font-semibold">Payroll Period Summary</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Live from attendance records, hourly rates and monthly salaries — click a row to expand per-worker details.
+              </p>
+            </div>
+            <div className="ml-auto flex gap-1 rounded-lg border border-border bg-secondary/40 p-1">
+              {(["weekly", "monthly", "yearly"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setPeriod(t)}
+                  className={`rounded-md px-3 py-1.5 text-xs font-medium capitalize transition-colors ${
+                    period === t ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-secondary"
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+          <PayrollSummary period={period} />
+        </Card>
+      </div>
+
+      {open && (
+        <EntryForm
+          editing={editing}
+          initial={
+            editing
+              ? {
+                  workerId: editing.workerId,
+                  date: editing.date,
+                  in: editing.in,
+                  out: editing.out || "",
+                  location: editing.location,
+                }
+              : blank
+          }
+          onClose={() => {
+            setOpen(false);
+            setEditing(null);
+          }}
+        />
+      )}
+    </AdminShell>
+  );
+}
